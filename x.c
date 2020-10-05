@@ -34,6 +34,7 @@ typedef struct {
 	void (*func)(const Arg *);
 	const Arg arg;
 	uint  release;
+	int  altscrn;  /* 0: don't care, -1: not alt screen, 1: alt screen */
 } MouseShortcut;
 
 typedef struct {
@@ -105,6 +106,7 @@ typedef struct {
 	XSetWindowAttributes attrs;
 	int scr;
 	int isfixed; /* is fixed geometry? */
+	int depth; /* bit depth */
 	int l, t; /* left and top offset */
 	int gm; /* geometry mask */
 } XWindow;
@@ -157,6 +159,7 @@ static void xhints(void);
 static int xloadcolor(int, const char *, Color *);
 static int xloadfont(Font *, FcPattern *);
 static void xloadfonts(char *, double);
+static void xloadsparefont();
 static void xunloadfont(Font *);
 static void xunloadfonts(void);
 static void xsetenv(void);
@@ -243,6 +246,7 @@ static char *usedfont = NULL;
 static double usedfontsize = 0;
 static double defaultfontsize = 0;
 
+static char *opt_alpha = NULL;
 static char *opt_class = NULL;
 static char **opt_cmd  = NULL;
 static char *opt_embed = NULL;
@@ -306,6 +310,7 @@ zoomabs(const Arg *arg)
 {
 	xunloadfonts();
 	xloadfonts(usedfont, arg->f);
+	xloadsparefont();
 	cresize(0, 0);
 	redraw();
 	xhints();
@@ -446,6 +451,7 @@ mouseaction(XEvent *e, uint release)
 	for (ms = mshortcuts; ms < mshortcuts + LEN(mshortcuts); ms++) {
 		if (ms->release == release &&
 		    ms->button == e->xbutton.button &&
+		    (!ms->altscrn || (ms->altscrn == (tisaltscr() ? 1 : -1))) &&
 		    (match(ms->mod, state) ||  /* exact or forced */
 		     match(ms->mod, state & ~forcemousemod))) {
 			ms->func(&(ms->arg));
@@ -734,7 +740,7 @@ xresize(int col, int row)
 
 	XFreePixmap(xw.dpy, xw.buf);
 	xw.buf = XCreatePixmap(xw.dpy, xw.win, win.w, win.h,
-			DefaultDepth(xw.dpy, xw.scr));
+			xw.depth);
 	XftDrawChange(xw.draw, xw.buf);
 	xclear(0, 0, win.w, win.h);
 
@@ -794,6 +800,13 @@ xloadcols(void)
 			else
 				die("could not allocate color %d\n", i);
 		}
+
+	/* set alpha value of bg color */
+	if (opt_alpha)
+		alpha = strtof(opt_alpha, NULL);
+	dc.col[defaultbg].color.alpha = (unsigned short)(0xffff * alpha);
+	dc.col[defaultbg].pixel &= 0x00FFFFFF;
+	dc.col[defaultbg].pixel |= (unsigned char)(0xff * alpha) << 24;
 	loaded = 1;
 }
 
@@ -1020,6 +1033,67 @@ xloadfonts(char *fontstr, double fontsize)
 }
 
 void
+xloadsparefont()
+{
+	FcPattern *fontpattern, *match;
+	FcResult result;
+
+	/* add font2 to font cache as first 4 entries */
+	if ( font2[0] == '-' )
+		fontpattern = XftXlfdParse(font2, False, False);
+	else
+		fontpattern = FcNameParse((FcChar8 *)font2);
+	if ( fontpattern ) {
+		/* Allocate memory for the new cache entries. */
+		frccap += 4;
+		frc = xrealloc(frc, frccap * sizeof(Fontcache));
+		/* add Normal */
+		match = FcFontMatch(NULL, fontpattern, &result);
+		if ( match )
+			frc[frclen].font = XftFontOpenPattern(xw.dpy, match);
+			if ( frc[frclen].font ) {
+				frc[frclen].flags = FRC_NORMAL;
+				frclen++;
+			} else
+				FcPatternDestroy(match);
+		/* add Italic */
+		FcPatternDel(fontpattern, FC_SLANT);
+		FcPatternAddInteger(fontpattern, FC_SLANT, FC_SLANT_ITALIC);
+		match = FcFontMatch(NULL, fontpattern, &result);
+		if ( match )
+			frc[frclen].font = XftFontOpenPattern(xw.dpy, match);
+			if ( frc[frclen].font ) {
+				frc[frclen].flags = FRC_ITALIC;
+				frclen++;
+			} else
+				FcPatternDestroy(match);
+		/* add Italic Bold */
+		FcPatternDel(fontpattern, FC_WEIGHT);
+		FcPatternAddInteger(fontpattern, FC_WEIGHT, FC_WEIGHT_BOLD);
+		match = FcFontMatch(NULL, fontpattern, &result);
+		if ( match )
+			frc[frclen].font = XftFontOpenPattern(xw.dpy, match);
+			if ( frc[frclen].font ) {
+				frc[frclen].flags = FRC_ITALICBOLD;
+				frclen++;
+			} else
+				FcPatternDestroy(match);
+		/* add Bold */
+		FcPatternDel(fontpattern, FC_SLANT);
+		FcPatternAddInteger(fontpattern, FC_SLANT, FC_SLANT_ROMAN);
+		match = FcFontMatch(NULL, fontpattern, &result);
+		if ( match )
+			frc[frclen].font = XftFontOpenPattern(xw.dpy, match);
+			if ( frc[frclen].font ) {
+				frc[frclen].flags = FRC_BOLD;
+				frclen++;
+			} else
+				FcPatternDestroy(match);
+		FcPatternDestroy(fontpattern);
+	}
+}
+
+void
 xunloadfont(Font *f)
 {
 	XftFontClose(xw.dpy, f->match);
@@ -1103,11 +1177,23 @@ xinit(int cols, int rows)
 	Window parent;
 	pid_t thispid = getpid();
 	XColor xmousefg, xmousebg;
+	XWindowAttributes attr;
+	XVisualInfo vis;
 
 	if (!(xw.dpy = XOpenDisplay(NULL)))
 		die("can't open display\n");
 	xw.scr = XDefaultScreen(xw.dpy);
-	xw.vis = XDefaultVisual(xw.dpy, xw.scr);
+
+	if (!(opt_embed && (parent = strtol(opt_embed, NULL, 0)))) {
+		parent = XRootWindow(xw.dpy, xw.scr);
+		xw.depth = 32;
+	} else {
+		XGetWindowAttributes(xw.dpy, parent, &attr);
+		xw.depth = attr.depth;
+	}
+
+	XMatchVisualInfo(xw.dpy, xw.scr, xw.depth, TrueColor, &vis);
+	xw.vis = vis.visual;
 
 	/* font */
 	if (!FcInit())
@@ -1116,8 +1202,11 @@ xinit(int cols, int rows)
 	usedfont = (opt_font == NULL)? font : opt_font;
 	xloadfonts(usedfont, 0);
 
+	/* spare font (font2) */
+	xloadsparefont();
+
 	/* colors */
-	xw.cmap = XDefaultColormap(xw.dpy, xw.scr);
+	xw.cmap = XCreateColormap(xw.dpy, parent, xw.vis, None);
 	xloadcols();
 
 	/* adjust fixed window geometry */
@@ -1137,19 +1226,15 @@ xinit(int cols, int rows)
 		| ButtonMotionMask | ButtonPressMask | ButtonReleaseMask;
 	xw.attrs.colormap = xw.cmap;
 
-	if (!(opt_embed && (parent = strtol(opt_embed, NULL, 0))))
-		parent = XRootWindow(xw.dpy, xw.scr);
 	xw.win = XCreateWindow(xw.dpy, parent, xw.l, xw.t,
-			win.w, win.h, 0, XDefaultDepth(xw.dpy, xw.scr), InputOutput,
+			win.w, win.h, 0, xw.depth, InputOutput,
 			xw.vis, CWBackPixel | CWBorderPixel | CWBitGravity
 			| CWEventMask | CWColormap, &xw.attrs);
 
 	memset(&gcvalues, 0, sizeof(gcvalues));
 	gcvalues.graphics_exposures = False;
-	dc.gc = XCreateGC(xw.dpy, parent, GCGraphicsExposures,
-			&gcvalues);
-	xw.buf = XCreatePixmap(xw.dpy, xw.win, win.w, win.h,
-			DefaultDepth(xw.dpy, xw.scr));
+	xw.buf = XCreatePixmap(xw.dpy, xw.win, win.w, win.h, xw.depth);
+	dc.gc = XCreateGC(xw.dpy, xw.buf, GCGraphicsExposures, &gcvalues);
 	XSetForeground(xw.dpy, dc.gc, dc.col[defaultbg].pixel);
 	XFillRectangle(xw.dpy, xw.buf, dc.gc, 0, 0, win.w, win.h);
 
@@ -1987,6 +2072,9 @@ main(int argc, char *argv[])
 	ARGBEGIN {
 	case 'a':
 		allowaltscreen = 0;
+		break;
+	case 'A':
+		opt_alpha = EARGF(usage());
 		break;
 	case 'c':
 		opt_class = EARGF(usage());
